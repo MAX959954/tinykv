@@ -1,0 +1,4 @@
+build/
+*.o
+kvserver
+kv.log
