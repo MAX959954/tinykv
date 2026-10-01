@@ -32,6 +32,11 @@ int linebuf_extract(LineBuf * lb , char *line_out , size_t line_out_size){
 
     size_t line_len = (size_t) (nl - lb->buf);
     size_t copy_len = line_len;
+    // Accept "\r\n" as well as "\n" (telnet and many clients send CRLF);
+    // otherwise the '\r' would end up stored as part of the value.
+    if (copy_len > 0 && lb->buf[copy_len - 1] == '\r') {
+        copy_len--;
+    }
     if (copy_len >= line_out_size) {
         copy_len = line_out_size - 1;
     }
