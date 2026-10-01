@@ -40,11 +40,18 @@ static void dispatch(Command *cmd , char *reply , size_t reply_size){
 
     switch (cmd->type) {
     case CMD_SET: {
+        //builds the text record that gets appended to the write-ahead log (WAL) file.
+        //The buffer is sized for the largest possible key + value, and we
+        //still check for truncation: a record cut short would lose its '\n'
+        //and stop replay_log() from reading anything after it.
+        char record[WAL_MAX_RECORD];
+        int len = snprintf(record , sizeof(record) , "SET %s %s\n" , cmd->key , cmd->value);
+        if (len < 0 || (size_t)len >= sizeof(record)) {
+            snprintf(reply , reply_size , "ERROR\n");
+            break;
+        }
         //stores the key/value in memory.
         hashmap_set(map, cmd->key, cmd->value);
-        char record[MAX_LINE];
-        //builds the text record that gets appended to the write-ahead log (WAL) file
-        snprintf(record , sizeof(record) , "SET %s %s\n" , cmd->key , cmd->value);
         //writes it to disk
         wal_write(wal_file , record);
         snprintf(reply  , reply_size , "OK\n");
@@ -60,7 +67,7 @@ static void dispatch(Command *cmd , char *reply , size_t reply_size){
         //removes the key, returning 0 on success → found
         int found = (hashmap_del(map , cmd->key)== 0 );
         if (found) {
-            char record[MAX_LINE];
+            char record[WAL_MAX_RECORD];
             snprintf(record , sizeof(record) , "DEL %s\n" , cmd->key);
             wal_write(wal_file , record);
         }
@@ -99,23 +106,36 @@ static void * handle_client(void *arg) {
         ssize_t n = recv(fd , chunk , sizeof(chunk) , 0 );
         if ( n <=  0 ) break; // disconnect or error
 
-        //feeds whatever bytes just arrived into the line buffer
-        if(linebuf_append(&lb  , chunk , (size_t)n) == -1) break;
+        //feed the bytes into the line buffer in pieces that fit, draining
+        //complete lines in between. Appending the whole chunk at once would
+        //wrongly reject valid input when the buffer holds the start of one
+        //line and the chunk carries its end plus further pipelined commands.
+        size_t off = 0;
+        while (off < (size_t)n) {
+            size_t space = linebuf_space(&lb);
+            //buffer full and still no '\n': a single line longer than
+            //MAX_LINE -- protocol violation, drop the client.
+            if (space == 0) goto disconnected;
 
-        int got;
-        while ((got = linebuf_extract(&lb , line , sizeof(line))) == 1) {
-            Command  cmd ;
-            //turns the raw text line into a structured Command
-            if (parse_command(line , &cmd) != 0 ) {
-                snprintf(reply , sizeof(reply) , "ERROR\n");
-            }else { 
-                dispatch(&cmd , reply , sizeof(reply));
-            }
-            //write the reply back to the client over the same socket.
-            //if the client already disconnected, send() fails with EPIPE
-            //instead of raising SIGPIPE (ignored below) -- just drop this client.
-            if (send(fd , reply , strlen(reply) , 0 ) == -1) {
-                goto disconnected;
+            size_t take = (size_t)n - off;
+            if (take > space) take = space;
+            linebuf_append(&lb , chunk + off , take);
+            off += take;
+
+            while (linebuf_extract(&lb , line , sizeof(line)) == 1) {
+                Command  cmd ;
+                //turns the raw text line into a structured Command
+                if (parse_command(line , &cmd) != 0 ) {
+                    snprintf(reply , sizeof(reply) , "ERROR\n");
+                }else {
+                    dispatch(&cmd , reply , sizeof(reply));
+                }
+                //write the reply back to the client over the same socket.
+                //if the client already disconnected, send() fails with EPIPE
+                //instead of raising SIGPIPE (ignored below) -- just drop this client.
+                if (send(fd , reply , strlen(reply) , 0 ) == -1) {
+                    goto disconnected;
+                }
             }
         }
     }

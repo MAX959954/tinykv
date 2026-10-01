@@ -33,7 +33,8 @@ NOT_FOUND
 
 ## Protocol
 
-Line-based, one command per line, `\n`-terminated, max line length 512 bytes.
+Line-based, one command per line, `\n`-terminated, max line length 512 bytes (including the `\n`), max key length
+127 bytes.
 
 | Command | Request | Reply |
 |---|---|---|
@@ -126,30 +127,52 @@ consume, at the cost of rejecting legitimately long values.
 
 ## Testing
 
-No automated test suite yet (see [Known limitations](#known-limitations)),
-but the following was manually verified:
+Regression tests live in `tests/regression_test.py`. Each test starts the
+server in a fresh temporary directory, talks to it over TCP, and — where
+durability is involved — `SIGKILL`s and restarts it:
 
-- **Persistence**: several `SET`s, `kill -9` the server mid-session,
-  restart, `GET` the keys back — data survives.
-- **Concurrency**: 8 clients issuing 1,600 concurrent `SET`/`GET` calls
-  against the *same* key — no crashes, no corrupted values, and the WAL
-  came out with every record intact and in order.
-- **Malformed/edge-case input**: empty lines, `SET` with no value, a line
-  split across multiple `recv()` calls, multiple commands coalesced into
-  one `recv()`, and an oversized (>512 byte) line — all handled without
-  crashing.
-- **The `SIGPIPE` bug above** — found by testing a client that disconnects
-  mid-pipeline, reproduced 5/5 times before the fix, 0/5 after.
+```sh
+cmake -B build && cmake --build build
+ctest --test-dir build --output-on-failure
+# or directly:
+python3 tests/regression_test.py build/kvserver
+```
+
+Covered: basic `SET`/`GET`/`DEL`/malformed input, a maximum-length record
+surviving a crash + replay, over-long keys being rejected, pipelined
+commands split across `recv()` boundaries, and oversized lines dropping only
+the offending client.
+
+Bugs found and fixed this way (each now has a regression test):
+
+- **A maximum-length `SET` broke WAL replay.** The record buffer was the same
+  size as the input line, so `"SET <key> <value>\n"` could be truncated — losing
+  its `\n`. On restart, `replay_log` treated it as a torn write and stopped,
+  silently dropping every write acknowledged after it. Record buffers are now
+  sized from `WAL_MAX_RECORD`, and truncation is checked before anything is
+  applied.
+- **Long keys were silently truncated.** `sscanf("%127s")` cut the key at 127
+  bytes and the remainder leaked into the value. Keys over `MAX_KEY` are now
+  rejected with `ERROR`.
+- **Valid pipelined input could disconnect a client.** A whole `recv()` chunk
+  was appended to the line buffer at once, so a partial line plus a chunk
+  carrying its end and more commands could exceed 512 bytes even though every
+  line was valid. Input is now fed in pieces, draining complete lines between
+  them.
+
+Also verified manually: 8 clients issuing 1,600 concurrent `SET`/`GET` calls
+against the same key (no crashes, WAL intact and in order), and the `SIGPIPE`
+bug described above (reproduced 5/5 before the fix, 0/5 after).
 
 ## Known limitations
 
 - No authentication, encryption, or rate limiting — trusted-network use only.
-- No automated test suite — `parse_command` and the hash map are pure
-  functions that are straightforward to unit-test with plain `assert()`,
-  but that harness doesn't exist yet.
-- Values are capped at just under 512 bytes (`MAX_LINE`), since a command
-  line — verb, key, and value together — must fit in one line buffer.
+- No unit tests yet for the pure modules (`parse_command`, `linebuf`, the
+  hash map) — only end-to-end regression tests over TCP.
+- Keys are capped at 127 bytes (`MAX_KEY`); values at just under 512 bytes
+  (`MAX_LINE`), since a command line — verb, key, and value together — must
+  fit in one line buffer.
 - Thread-per-connection has no cap on concurrent connections; a large
   number of simultaneous clients means a large number of OS threads.
 - IPv4 and IPv6 are both accepted (`AF_UNSPEC`), but this hasn't been
-  tested over IPv6 specifically.
+  tested over IPv6 specifically.

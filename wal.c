@@ -22,9 +22,11 @@ void wal_write(FILE *wal_file, const char * record){
 void replay_log(const char * path , HashMap *map){
     FILE * f = fopen(path , "r");
     if  (!f) return ;
-    char line[MAX_LINE];
+    char line[WAL_MAX_RECORD];
     while (fgets(line , sizeof(line) ,  f)){
         size_t len = strlen(line);
+        // A record without a trailing '\n' can only be a torn write at the
+        // very end of the log (crash mid-append) — stop replaying there.
         if (len == 0 || line[len - 1] != '\n'){
             break;
         }

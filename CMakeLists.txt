@@ -15,3 +15,10 @@ add_executable(kvserver
 )
 target_compile_options(kvserver PRIVATE -Wall -Wextra)
 target_link_libraries(kvserver PRIVATE Threads::Threads)
+
+enable_testing()
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_test(NAME regression
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/regression_test.py $<TARGET_FILE:kvserver>)
+endif()
