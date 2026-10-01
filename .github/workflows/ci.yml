@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} / ${{ matrix.sanitizer || 'no sanitizer' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        sanitizer: ["", "address,undefined", "thread"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # TSan fails to start on recent kernels with high mmap ASLR entropy
+      - name: Lower ASLR entropy for TSan
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler }}
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DTINYKV_WERROR=ON
+          -DTINYKV_SANITIZE="${{ matrix.sanitizer }}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+  benchmark:
+    name: benchmark (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+      - name: Run
+        run: bash bench/run_bench.sh build --quick

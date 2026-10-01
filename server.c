@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,41 +12,13 @@
 
 #include "linebuf.h"
 #include "command.h"
-#include "hashmap.h"
-#include "wal.h"
+#include "store.h"
 
-#define PORT "9999"
-#define BACKLOG 10
-#define WAL_PATH "kv.log"
+#define DEFAULT_PORT "9999"
+#define DEFAULT_WAL  "kv.log"
+#define BACKLOG 128
 
-static HashMap *map;
-static FILE * wal_file;
-
-//Set (under g_lock) after the first failed WAL write. From then on every
-//write is refused: after a failed fputs/fflush the log may end in a partial
-//record, and appending after it would make later records unreadable on
-//replay. Reads keep working; an operator restarts the server once the disk
-//problem (full disk, I/O error) is fixed.
-static int wal_failed = 0;
-
-//Without a lock, two threads doing e.g. SET foo bar concurrently
-// could interleave their reads/writes inside hashmap and corrupt
-// it — classic data race, undefined behavior,
-static pthread_mutex_t g_lock  = PTHREAD_MUTEX_INITIALIZER; //intializes it in compile time 
-
-
-//Appends a record to the WAL. Must be called with g_lock held.
-//Returns 1 if the record is durable, 0 if the write was refused or failed.
-static int log_record(const char *record) {
-    if (wal_failed) return 0;
-    if (wal_write(wal_file , record) != 0) {
-        perror("wal_write");
-        fprintf(stderr , "WAL write failed; refusing further writes until restart\n");
-        wal_failed = 1;
-        return 0;
-    }
-    return 1;
-}
+static Store *store;
 
 //send() on a stream socket may write only part of the buffer (e.g. when the
 //socket's send buffer is nearly full), so keep going until all of it is out.
@@ -64,78 +36,32 @@ static int send_all(int fd , const char *buf , size_t len) {
     return 0;
 }
 
-//dispatch() is the glue — it takes a parsed command and turns it into
-// an actual state change (hashmap + WAL) plus a reply, all under one 
-// lock so SET-then-log can't be interrupted by another thread
-static void dispatch(Command *cmd , char *reply , size_t reply_size){
-
-
-    //(a struct with internal state — locked/unlocked, waiting 
-    //threads, etc.). If you passed it by value, the function 
-    //would get a copy of that state, lock the copy, and your 
-    //real g_lock would stay untouched — so it wouldn't actually block other threads.
-    pthread_mutex_lock(&g_lock);
-
+//dispatch() is the glue -- it hands a parsed command to the store and turns
+//the result into a reply line. All locking and durability live in store.c.
+static void dispatch(const Command *cmd , char *reply , size_t reply_size){
+    StoreResult r;
     switch (cmd->type) {
-    case CMD_SET: {
-        //builds the text record that gets appended to the write-ahead log (WAL) file.
-        //The buffer is sized for the largest possible key + value, and we
-        //still check for truncation: a record cut short would lose its '\n'
-        //and stop replay_log() from reading anything after it.
-        char record[WAL_MAX_RECORD];
-        int len = snprintf(record , sizeof(record) , "SET %s %s\n" , cmd->key , cmd->value);
-        if (len < 0 || (size_t)len >= sizeof(record)) {
-            snprintf(reply , reply_size , "ERROR\n");
-            break;
-        }
-        //log first, then apply: memory must never contain a write that
-        //isn't on disk, or a GET could return a value that a crash undoes.
-        if (!log_record(record)) {
-            snprintf(reply , reply_size , "ERROR\n");
-            break;
-        }
-        if (hashmap_set(map, cmd->key, cmd->value) != 0) {
-            //The write is already durable but can't be applied in memory.
-            //Replying ERROR would be a lie (it reappears after a restart),
-            //so stop instead: the WAL is the source of truth and replay on
-            //the next start rebuilds a consistent state.
-            fprintf(stderr , "out of memory applying SET; exiting (WAL is intact)\n");
-            abort();
-        }
-        snprintf(reply  , reply_size , "OK\n");
+    case CMD_SET:
+        r = store_set(store , cmd->key , cmd->value);
         break;
-    }
-    case CMD_GET: {
-        //looks up the value
-       const char *v  = hashmap_get(map , cmd->key);
-       snprintf(reply , reply_size , v ? "%s\n" : "NOT_FOUND\n", v ? v : "");
-       break;
-    }
-    case CMD_DEL: {
-        //deleting a missing key changes nothing, so there's nothing to log
-        if (hashmap_get(map , cmd->key) == NULL) {
-            snprintf(reply , reply_size , "NOT_FOUND\n");
-            break;
-        }
-        //same order as SET: the DEL record must be durable before the key
-        //disappears from memory, so a crash can't resurrect a deleted key
-        //that a client was already told is gone.
-        char record[WAL_MAX_RECORD];
-        snprintf(record , sizeof(record) , "DEL %s\n" , cmd->key);
-        if (!log_record(record)) {
-            snprintf(reply , reply_size , "ERROR\n");
-            break;
-        }
-        hashmap_del(map , cmd->key);
-        snprintf(reply, reply_size, "OK\n");
+    case CMD_DEL:
+        r = store_del(store , cmd->key);
         break;
-    }
+    case CMD_GET:
+        //leave room for the trailing '\n'
+        r = store_get(store , cmd->key , reply , reply_size - 1);
+        if (r == STORE_OK) {
+            strcat(reply , "\n");
+            return;
+        }
+        break;
     default:
-      snprintf(reply , reply_size , "ERROR\n");
+        r = STORE_ERROR;
     }
-
-    //Unlock the mutex , so the next thread can get in
-    pthread_mutex_unlock(&g_lock);
+    const char *text = (r == STORE_OK) ? "OK\n"
+                     : (r == STORE_NOT_FOUND) ? "NOT_FOUND\n"
+                     : "ERROR\n";
+    snprintf(reply , reply_size , "%s" , text);
 }
 
 static void * handle_client(void *arg) {
@@ -143,18 +69,14 @@ static void * handle_client(void *arg) {
     //(see main), so each thread has its own copy and nothing needs freeing
     int fd = (int)(intptr_t)arg;
 
-    //sets up a fresh per-connection line buffer (the linebuf.c reassembly
-    // logic from earlier), scoped to this thread/connection only
+    //a fresh per-connection line buffer, scoped to this thread only
     LineBuf lb;
     linebuf_init(&lb);
-    /*
-    three buffers: chunk is the raw recv scratch space, 
-    line holds one extracted command line, reply holds the response text.
-    */
+    //chunk is the raw recv scratch space, line holds one extracted
+    //command line, reply holds the response text
     char chunk[512], line[MAX_LINE] , reply[MAX_LINE];
 
     for(;;) {
-        //main read loop.
         ssize_t n = recv(fd , chunk , sizeof(chunk) , 0 );
         if ( n <=  0 ) break; // disconnect or error
 
@@ -176,15 +98,13 @@ static void * handle_client(void *arg) {
 
             while (linebuf_extract(&lb , line , sizeof(line)) == 1) {
                 Command  cmd ;
-                //turns the raw text line into a structured Command
                 if (parse_command(line , &cmd) != 0 ) {
                     snprintf(reply , sizeof(reply) , "ERROR\n");
                 }else {
                     dispatch(&cmd , reply , sizeof(reply));
                 }
-                //write the reply back to the client over the same socket.
                 //if the client already disconnected, send() fails with EPIPE
-                //instead of raising SIGPIPE (ignored below) -- just drop this client.
+                //instead of raising SIGPIPE (ignored in main) -- drop this client.
                 if (send_all(fd , reply , strlen(reply)) == -1) {
                     goto disconnected;
                 }
@@ -197,14 +117,14 @@ disconnected:
     return NULL;
 }
 
-static int make_listener(void ) {
+static int make_listener(const char *port) {
     struct addrinfo hints , *res , *p;
     memset(&hints , 0 , sizeof(hints));
     hints.ai_family= AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    int status = getaddrinfo(NULL , PORT , &hints , &res);
+    int status = getaddrinfo(NULL , port , &hints , &res);
 
     if (status != 0 ) {fprintf(stderr , "getaddrinfo: %s\n" , gai_strerror(status)); exit(1); }
 
@@ -221,27 +141,54 @@ static int make_listener(void ) {
     }
 
     freeaddrinfo(res);
-    if (listenfd == -1) {fprintf(stderr , "failed to bind\n"); exit(1);}
+    if (listenfd == -1) {fprintf(stderr , "failed to bind port %s\n" , port); exit(1);}
     if (listen(listenfd , BACKLOG) == -1) {perror("listen"); exit(1);}
     return listenfd;
 }
 
-int main () {
+static void usage(const char *prog) {
+    fprintf(stderr ,
+        "usage: %s [-p port] [-w wal_path] [-m group|serial|nosync]\n"
+        "  -p  TCP port to listen on (default " DEFAULT_PORT ")\n"
+        "  -w  write-ahead log file (default " DEFAULT_WAL ")\n"
+        "  -m  group   rwlock + group commit (default)\n"
+        "      serial  one global lock, fsync per write (old design, for benchmarks)\n"
+        "      nosync  group mode without fsync -- NOT durable, benchmarks only\n" ,
+        prog);
+}
+
+int main (int argc , char **argv) {
+    const char *port = DEFAULT_PORT;
+    const char *wal_path = DEFAULT_WAL;
+    StoreMode mode = STORE_MODE_GROUP;
+
+    int opt;
+    while ((opt = getopt(argc , argv , "p:w:m:h")) != -1) {
+        switch (opt) {
+        case 'p': port = optarg; break;
+        case 'w': wal_path = optarg; break;
+        case 'm':
+            if      (strcmp(optarg , "group")  == 0) mode = STORE_MODE_GROUP;
+            else if (strcmp(optarg , "serial") == 0) mode = STORE_MODE_SERIAL;
+            else if (strcmp(optarg , "nosync") == 0) mode = STORE_MODE_NOSYNC;
+            else { usage(argv[0]); return 2; }
+            break;
+        default: usage(argv[0]); return opt == 'h' ? 0 : 2;
+        }
+    }
+
     //a client disconnecting mid-response makes send() fail with EPIPE
     //rather than raising SIGPIPE, whose default action would kill the
     //whole process (every other connected client) over one bad client.
     signal(SIGPIPE , SIG_IGN);
 
-    map = hashmap_create(1024);
-    if (!map) { fprintf(stderr , "out of memory\n"); return 1; }
-    if (replay_log(WAL_PATH , map) != 0) {
-        fprintf(stderr , "out of memory while replaying %s\n" , WAL_PATH);
-        return 1;
-    }
-    wal_file = wal_open(WAL_PATH);
+    store = store_open(wal_path , mode);
+    if (!store) return 1;
 
-    int listenfd = make_listener();
-    printf("listening on port %s\n" , PORT);
+    int listenfd = make_listener(port);
+    printf("listening on port %s (wal: %s, mode: %s)\n" , port , wal_path ,
+           mode == STORE_MODE_GROUP ? "group" : mode == STORE_MODE_SERIAL ? "serial" : "nosync");
+    fflush(stdout);
 
     for (;;) {
         int clientfd = accept(listenfd , NULL , NULL);
