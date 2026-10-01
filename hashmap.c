@@ -24,8 +24,13 @@ static unsigned long hash(const char * key) {
 }
 
 HashMap * hashmap_create(size_t nbuckets) {
-    HashMap *map = (HashMap *)malloc(sizeof(HashMap));
-    map->buckets = (HashNode**) calloc(nbuckets, sizeof(HashNode*));
+    HashMap *map = malloc(sizeof(HashMap));
+    if (!map) return NULL;
+    map->buckets = calloc(nbuckets, sizeof(HashNode*));
+    if (!map->buckets) {
+        free(map);
+        return NULL;
+    }
     map->nbuckets = nbuckets;
     return map ;
 }
@@ -48,19 +53,33 @@ void hashmap_destroy(HashMap * map){
 
 int hashmap_set(HashMap * map , const char * key , const char * value){
     size_t index = hash(key) % map->nbuckets;
+
+    // Allocate everything first, then mutate: if an allocation fails the
+    // map is left exactly as it was (never with a NULL value in a node).
+    char *new_value = strdup(value);
+    if (!new_value) return -1;
+
     for (HashNode * node = map->buckets[index]; node ; node = node->next) {
         if (strcmp(node->key ,key) == 0) {
             free(node->value);
-            node->value = strdup(value);
+            node->value = new_value;
             return 0;
         }
     }
-    HashNode * new_node = (HashNode*) malloc(sizeof(HashNode));
-    new_node->key = strdup(key);
-    new_node->value = strdup(value);
+
+    HashNode * new_node = malloc(sizeof(HashNode));
+    char *new_key = strdup(key);
+    if (!new_node || !new_key) {
+        free(new_node);
+        free(new_key);
+        free(new_value);
+        return -1;
+    }
+    new_node->key = new_key;
+    new_node->value = new_value;
     new_node->next = map->buckets[index];
     map->buckets[index] = new_node;
-    return 1;
+    return 0;
 }
 
 const char * hashmap_get(HashMap * map , const char * key){
@@ -90,6 +109,3 @@ int hashmap_del(HashMap * map , const char * key){
 
     return -1;
 }
-
-
- 

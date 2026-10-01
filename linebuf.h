@@ -21,7 +21,8 @@ size_t linebuf_space(const LineBuf * buf);
 // drain complete lines with linebuf_extract() in between.
 int linebuf_append(LineBuf * buf , const char * data , size_t len);
 
-// Extract one complete '\n'-terminated line (without the '\n') into
+// Extract one complete '\n'-terminated line (without the '\n', and
+// without a preceding '\r' if the client sent CRLF) into
 // line_out. Returns 1 if a line was extracted, 0 if no complete line
 // is buffered yet.
 int linebuf_extract(LineBuf * buf , char *line_out , size_t line_out_size);

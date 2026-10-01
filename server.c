@@ -1,4 +1,6 @@
 #define _POSIX_C_SOURCE 200112L
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,11 +22,47 @@
 static HashMap *map;
 static FILE * wal_file;
 
+//Set (under g_lock) after the first failed WAL write. From then on every
+//write is refused: after a failed fputs/fflush the log may end in a partial
+//record, and appending after it would make later records unreadable on
+//replay. Reads keep working; an operator restarts the server once the disk
+//problem (full disk, I/O error) is fixed.
+static int wal_failed = 0;
+
 //Without a lock, two threads doing e.g. SET foo bar concurrently
 // could interleave their reads/writes inside hashmap and corrupt
 // it — classic data race, undefined behavior,
 static pthread_mutex_t g_lock  = PTHREAD_MUTEX_INITIALIZER; //intializes it in compile time 
 
+
+//Appends a record to the WAL. Must be called with g_lock held.
+//Returns 1 if the record is durable, 0 if the write was refused or failed.
+static int log_record(const char *record) {
+    if (wal_failed) return 0;
+    if (wal_write(wal_file , record) != 0) {
+        perror("wal_write");
+        fprintf(stderr , "WAL write failed; refusing further writes until restart\n");
+        wal_failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
+//send() on a stream socket may write only part of the buffer (e.g. when the
+//socket's send buffer is nearly full), so keep going until all of it is out.
+//Returns 0 on success, -1 if the connection is broken.
+static int send_all(int fd , const char *buf , size_t len) {
+    while (len > 0) {
+        ssize_t n = send(fd , buf , len , 0);
+        if (n == -1) {
+            if (errno == EINTR) continue;   //interrupted by a signal: retry
+            return -1;                      //EPIPE, ECONNRESET, ...
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
 
 //dispatch() is the glue — it takes a parsed command and turns it into
 // an actual state change (hashmap + WAL) plus a reply, all under one 
@@ -50,10 +88,20 @@ static void dispatch(Command *cmd , char *reply , size_t reply_size){
             snprintf(reply , reply_size , "ERROR\n");
             break;
         }
-        //stores the key/value in memory.
-        hashmap_set(map, cmd->key, cmd->value);
-        //writes it to disk
-        wal_write(wal_file , record);
+        //log first, then apply: memory must never contain a write that
+        //isn't on disk, or a GET could return a value that a crash undoes.
+        if (!log_record(record)) {
+            snprintf(reply , reply_size , "ERROR\n");
+            break;
+        }
+        if (hashmap_set(map, cmd->key, cmd->value) != 0) {
+            //The write is already durable but can't be applied in memory.
+            //Replying ERROR would be a lie (it reappears after a restart),
+            //so stop instead: the WAL is the source of truth and replay on
+            //the next start rebuilds a consistent state.
+            fprintf(stderr , "out of memory applying SET; exiting (WAL is intact)\n");
+            abort();
+        }
         snprintf(reply  , reply_size , "OK\n");
         break;
     }
@@ -64,16 +112,22 @@ static void dispatch(Command *cmd , char *reply , size_t reply_size){
        break;
     }
     case CMD_DEL: {
-        //removes the key, returning 0 on success → found
-        int found = (hashmap_del(map , cmd->key)== 0 );
-        if (found) {
-            char record[WAL_MAX_RECORD];
-            snprintf(record , sizeof(record) , "DEL %s\n" , cmd->key);
-            wal_write(wal_file , record);
+        //deleting a missing key changes nothing, so there's nothing to log
+        if (hashmap_get(map , cmd->key) == NULL) {
+            snprintf(reply , reply_size , "NOT_FOUND\n");
+            break;
         }
-        //safe, bounded string formatting; the formatted line itself 
-        //the durability record so a crash doesn't undo the delete
-        snprintf(reply, reply_size, found ? "OK\n" : "NOT_FOUND\n");
+        //same order as SET: the DEL record must be durable before the key
+        //disappears from memory, so a crash can't resurrect a deleted key
+        //that a client was already told is gone.
+        char record[WAL_MAX_RECORD];
+        snprintf(record , sizeof(record) , "DEL %s\n" , cmd->key);
+        if (!log_record(record)) {
+            snprintf(reply , reply_size , "ERROR\n");
+            break;
+        }
+        hashmap_del(map , cmd->key);
+        snprintf(reply, reply_size, "OK\n");
         break;
     }
     default:
@@ -85,11 +139,9 @@ static void dispatch(Command *cmd , char *reply , size_t reply_size){
 }
 
 static void * handle_client(void *arg) {
-    //expected to point to the client socket fd that 
-    //was heap-allocated by the caller (so each thread
-    // gets its own copy, not a shared variable)
-    int fd = *(int*)arg;
-    free(arg);
+    //the fd is passed by value, packed into the pointer argument itself
+    //(see main), so each thread has its own copy and nothing needs freeing
+    int fd = (int)(intptr_t)arg;
 
     //sets up a fresh per-connection line buffer (the linebuf.c reassembly
     // logic from earlier), scoped to this thread/connection only
@@ -133,7 +185,7 @@ static void * handle_client(void *arg) {
                 //write the reply back to the client over the same socket.
                 //if the client already disconnected, send() fails with EPIPE
                 //instead of raising SIGPIPE (ignored below) -- just drop this client.
-                if (send(fd , reply , strlen(reply) , 0 ) == -1) {
+                if (send_all(fd , reply , strlen(reply)) == -1) {
                     goto disconnected;
                 }
             }
@@ -172,7 +224,7 @@ static int make_listener(void ) {
     if (listenfd == -1) {fprintf(stderr , "failed to bind\n"); exit(1);}
     if (listen(listenfd , BACKLOG) == -1) {perror("listen"); exit(1);}
     return listenfd;
-} 
+}
 
 int main () {
     //a client disconnecting mid-response makes send() fail with EPIPE
@@ -181,19 +233,31 @@ int main () {
     signal(SIGPIPE , SIG_IGN);
 
     map = hashmap_create(1024);
-    replay_log(WAL_PATH , map);
+    if (!map) { fprintf(stderr , "out of memory\n"); return 1; }
+    if (replay_log(WAL_PATH , map) != 0) {
+        fprintf(stderr , "out of memory while replaying %s\n" , WAL_PATH);
+        return 1;
+    }
     wal_file = wal_open(WAL_PATH);
 
     int listenfd = make_listener();
     printf("listening on port %s\n" , PORT);
 
     for (;;) {
-        int *clientfd = (int*)malloc(sizeof(int));
-        *clientfd = accept(listenfd , NULL , NULL);
-        if (*clientfd == -1) { perror("accept" ); free(clientfd ); continue; }
+        int clientfd = accept(listenfd , NULL , NULL);
+        if (clientfd == -1) { perror("accept"); continue; }
 
+        //pass the fd by value inside the void* argument: no heap allocation,
+        //so nothing to leak if thread creation fails
         pthread_t tid;
-        pthread_create(&tid , NULL , handle_client , clientfd);
+        int err = pthread_create(&tid , NULL , handle_client , (void *)(intptr_t)clientfd);
+        if (err != 0) {
+            //e.g. EAGAIN when the thread limit is hit: drop this client,
+            //keep serving the others
+            fprintf(stderr , "pthread_create: %s\n" , strerror(err));
+            close(clientfd);
+            continue;
+        }
         pthread_detach(tid);
     }
 }

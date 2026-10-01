@@ -33,14 +33,15 @@ NOT_FOUND
 
 ## Protocol
 
-Line-based, one command per line, `\n`-terminated, max line length 512 bytes (including the `\n`), max key length
-127 bytes.
+Line-based, one command per line, terminated by `\n` (a `\r\n` from telnet
+and similar clients is accepted too). Max line length 512 bytes including the
+terminator, max key length 127 bytes.
 
 | Command | Request | Reply |
 |---|---|---|
-| Set | `SET <key> <value>\n` | `OK\n` |
+| Set | `SET <key> <value>\n` | `OK\n`, or `ERROR\n` if the write could not be made durable |
 | Get | `GET <key>\n` | `<value>\n` or `NOT_FOUND\n` |
-| Delete | `DEL <key>\n` | `OK\n` or `NOT_FOUND\n` |
+| Delete | `DEL <key>\n` | `OK\n` or `NOT_FOUND\n` (`ERROR\n` as for `SET`) |
 | Malformed | anything else | `ERROR\n` (connection stays open) |
 
 `<value>` is everything after the second space to the end of the line, so it
@@ -88,12 +89,33 @@ operations actually happened in.
 cost of a small amount of parsing/formatting overhead per command — not a
 meaningful tradeoff at this scale.
 
-**WAL ordering: log, then acknowledge.** `wal_write()` does
-`fputs` → `fflush` → `fsync` *before* `dispatch()` replies `OK` to the
-client. If the fsync happened after the reply, a crash between the two could
-leave the client believing a write succeeded when it isn't actually on disk
-— "durable" would be a lie. The tradeoff is latency: every write pays for a
-synchronous disk flush before the client sees a response.
+**WAL ordering: log, then apply, then acknowledge.** For every `SET`/`DEL`,
+`wal_write()` does `fputs` → `fflush` → `fsync` and checks each step; only
+once the record is on disk is the hash map changed and `OK` sent. If the
+fsync happened after the reply, a crash between the two could leave the
+client believing a write succeeded when it isn't on disk — "durable" would
+be a lie. Applying to memory *after* logging matters too: otherwise a `GET`
+could briefly return a value that a crash would then undo. The tradeoff is
+latency: every write pays for a synchronous disk flush.
+
+**A failed WAL write makes the server read-only.** If any of the three steps
+fails (disk full, I/O error), the client gets `ERROR` and memory is left
+untouched. Every later write is refused too, until a restart: after a failed
+`fputs`/`fflush` the log may end in a partial record, and appending more
+after it would make those records unreadable on replay. Reads keep working
+in the meantime.
+
+**Out of memory after a write is logged → abort.** If the record is already
+durable but the hash map can't allocate memory to apply it, replying `ERROR`
+would be wrong (the write reappears after a restart). The server aborts
+instead; the WAL is the source of truth, and replay rebuilds a consistent
+state on the next start. Allocation failures everywhere else (startup,
+replay, thread creation) are checked and handled — a failed
+`pthread_create` drops only that one client.
+
+**Partial `send()`.** A stream socket may accept only part of a buffer, so
+replies go through `send_all()`, which loops until every byte is written
+(retrying on `EINTR`).
 
 **Ignoring `SIGPIPE`.** By default, writing to a socket after the peer has
 closed their end raises `SIGPIPE`, and a process that doesn't handle it is
@@ -139,9 +161,11 @@ python3 tests/regression_test.py build/kvserver
 ```
 
 Covered: basic `SET`/`GET`/`DEL`/malformed input, a maximum-length record
-surviving a crash + replay, over-long keys being rejected, pipelined
-commands split across `recv()` boundaries, and oversized lines dropping only
-the offending client.
+and a `DEL` surviving a crash + replay, over-long keys being rejected,
+pipelined commands split across `recv()` boundaries, oversized lines dropping
+only the offending client, CRLF line endings, and a failing disk (`kv.log`
+symlinked to `/dev/full`, so every write fails with `ENOSPC`): writes get
+`ERROR`, nothing is applied in memory, reads still work.
 
 Bugs found and fixed this way (each now has a regression test):
 
@@ -154,6 +178,11 @@ Bugs found and fixed this way (each now has a regression test):
 - **Long keys were silently truncated.** `sscanf("%127s")` cut the key at 127
   bytes and the remainder leaked into the value. Keys over `MAX_KEY` are now
   rejected with `ERROR`.
+- **A failed disk write was still acknowledged with `OK`.** `wal_write`
+  ignored the return values of `fputs`/`fflush`/`fsync`, and the hash map was
+  updated before the log, so a write that never reached disk was both
+  visible to `GET` and confirmed to the client.
+- **CRLF clients stored a stray `\r`.** `SET k v` from telnet stored `"v\r"`.
 - **Valid pipelined input could disconnect a client.** A whole `recv()` chunk
   was appended to the line buffer at once, so a partial line plus a chunk
   carrying its end and more commands could exceed 512 bytes even though every

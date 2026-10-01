@@ -146,12 +146,62 @@ def test_oversized_line_disconnects(srv):
     c.close()
 
 
+def test_crlf_line_endings(srv):
+    """telnet and many clients end lines with CR LF; the CR must not end up
+    in the stored value."""
+    c = Client()
+    c.send_raw(b"SET greeting hello world\r\n")
+    assert c.read_line() == "OK"
+    c.send_raw(b"GET greeting\r\n")
+    assert c.read_line() == "hello world"
+    assert c.cmd("GET greeting") == "hello world"  # plain LF still works
+    c.close()
+
+
+def test_delete_survives_restart(srv):
+    c = Client()
+    assert c.cmd("SET gone 1") == "OK"
+    assert c.cmd("SET kept 2") == "OK"
+    assert c.cmd("DEL gone") == "OK"
+    c.close()
+    srv.kill()
+    srv.start()
+    c = Client()
+    assert c.cmd("GET gone") == "NOT_FOUND"
+    assert c.cmd("GET kept") == "2"
+    c.close()
+
+
+def test_wal_failure_refuses_writes(srv):
+    """If the WAL can't be written (here: kv.log -> /dev/full, every write
+    fails with ENOSPC), a write must get ERROR -- never OK -- must not show up
+    in memory, and reads must keep working."""
+    if not os.path.exists("/dev/full"):
+        print("      (skipped: no /dev/full on this system)")
+        return
+    srv.kill()
+    log = os.path.join(srv.workdir, "kv.log")
+    os.remove(log)
+    os.symlink("/dev/full", log)
+    srv.start()
+    c = Client()
+    assert c.cmd("SET a 1") == "ERROR"
+    assert c.cmd("GET a") == "NOT_FOUND"   # not applied in memory either
+    assert c.cmd("SET b 2") == "ERROR"     # stays read-only after a failure
+    assert c.cmd("DEL a") == "NOT_FOUND"
+    assert c.cmd("GET b") == "NOT_FOUND"
+    c.close()
+
+
 TESTS = [
     test_basic,
     test_max_length_record_survives_restart,
     test_long_key_rejected,
     test_pipelined_lines_across_recv_boundary,
     test_oversized_line_disconnects,
+    test_crlf_line_endings,
+    test_delete_survives_restart,
+    test_wal_failure_refuses_writes,
 ]
 
 

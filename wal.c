@@ -1,8 +1,8 @@
 #include "wal.h"
 #include "command.h"
-#include <stdlib.h> 
+#include <stdlib.h>
 #include <string.h>
-#include <unistd.h> 
+#include <unistd.h>
 
 FILE  * wal_open(const char * path) {
     FILE * f = fopen(path , "a");
@@ -13,15 +13,16 @@ FILE  * wal_open(const char * path) {
     return f;
 }
 
-void wal_write(FILE *wal_file, const char * record){
-    fputs(record ,wal_file);
-    fflush(wal_file);
-    fsync(fileno(wal_file));
+int wal_write(FILE *wal_file, const char * record){
+    if (fputs(record , wal_file) == EOF) return -1;
+    if (fflush(wal_file) != 0) return -1;
+    if (fsync(fileno(wal_file)) != 0) return -1;
+    return 0;
 }
 
-void replay_log(const char * path , HashMap *map){
+int replay_log(const char * path , HashMap *map){
     FILE * f = fopen(path , "r");
-    if  (!f) return ;
+    if  (!f) return 0;
     char line[WAL_MAX_RECORD];
     while (fgets(line , sizeof(line) ,  f)){
         size_t len = strlen(line);
@@ -36,10 +37,15 @@ void replay_log(const char * path , HashMap *map){
 
         if (parse_command(line , &cmd) != 0 ) continue;
 
-        if(cmd.type == CMD_SET) hashmap_set(map , cmd.key , cmd.value);
-        else if (cmd.type == CMD_DEL) hashmap_del(map , cmd.key);
-
+        if (cmd.type == CMD_SET) {
+            if (hashmap_set(map , cmd.key , cmd.value) != 0) {
+                fclose(f);
+                return -1;
+            }
+        } else if (cmd.type == CMD_DEL) {
+            hashmap_del(map , cmd.key);
+        }
     }
     fclose(f);
+    return 0;
 }
-
