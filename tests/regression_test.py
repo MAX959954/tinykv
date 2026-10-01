@@ -4,18 +4,31 @@
 Usage:  python3 tests/regression_test.py ./build/kvserver
 
 Each test starts the server in a fresh temporary directory (so it gets its
-own empty kv.log), talks to it over TCP, and checks the replies.
+own empty kv.log) on a free port, talks to it over TCP, and checks the
+replies. If the server was built with sanitizers, any sanitizer report in
+its stderr fails the test.
 """
 import os
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
-PORT = 9999
+PORT = None  # chosen per test
 MAX_LINE = 512
 MAX_KEY = 127
+
+
+SANITIZER_MARKERS = ("ERROR: AddressSanitizer", "WARNING: ThreadSanitizer",
+                     "runtime error:", "ERROR: LeakSanitizer")
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 class Server:
@@ -23,11 +36,15 @@ class Server:
         self.binary = binary
         self.workdir = workdir
         self.proc = None
+        self.stderr_path = os.path.join(workdir, "server.stderr")
 
     def start(self):
-        self.proc = subprocess.Popen([self.binary], cwd=self.workdir,
+        global PORT
+        PORT = free_port()
+        self.stderr = open(self.stderr_path, "a")
+        self.proc = subprocess.Popen([self.binary, "-p", str(PORT)], cwd=self.workdir,
                                      stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+                                     stderr=self.stderr)
         deadline = time.time() + 5
         while time.time() < deadline:
             try:
@@ -41,6 +58,12 @@ class Server:
         """Simulates a crash: SIGKILL, no chance to clean up."""
         self.proc.kill()
         self.proc.wait()
+        self.stderr.close()
+
+    def sanitizer_report(self):
+        with open(self.stderr_path, errors="replace") as f:
+            text = f.read()
+        return text if any(m in text for m in SANITIZER_MARKERS) else None
 
 
 class Client:
@@ -193,6 +216,43 @@ def test_wal_failure_refuses_writes(srv):
     c.close()
 
 
+def test_crash_under_concurrent_load(srv):
+    """8 clients write concurrently; the server is SIGKILLed mid-stream.
+    After restart, every write that was acknowledged with OK must be there
+    (writes still in flight may or may not have made it -- both are fine)."""
+    clients, stop = 8, threading.Event()
+    acked = [0] * clients        # highest i acknowledged for client c
+
+    def writer(c):
+        try:
+            cl = Client()
+            i = 0
+            while not stop.is_set():
+                i += 1
+                if cl.cmd(f"SET c{c}:{i} v{i}") != "OK":
+                    return
+                acked[c] = i
+        except (OSError, ConnectionError):
+            pass                 # the server was killed under us
+
+    threads = [threading.Thread(target=writer, args=(c,)) for c in range(clients)]
+    for t in threads:
+        t.start()
+    time.sleep(1.0)
+    srv.kill()
+    stop.set()
+    for t in threads:
+        t.join()
+    assert sum(acked) > 0, "no writes were acknowledged"
+
+    srv.start()
+    c = Client()
+    for client, last in enumerate(acked):
+        for i in range(1, last + 1):
+            assert c.cmd(f"GET c{client}:{i}") == f"v{i}", f"lost acked write c{client}:{i}"
+    c.close()
+    print(f"      {sum(acked)} acknowledged writes, all present after the crash")
+
 TESTS = [
     test_basic,
     test_max_length_record_survives_restart,
@@ -202,6 +262,7 @@ TESTS = [
     test_crlf_line_endings,
     test_delete_survives_restart,
     test_wal_failure_refuses_writes,
+    test_crash_under_concurrent_load,
 ]
 
 
@@ -217,12 +278,16 @@ def main():
             srv.start()
             try:
                 test(srv)
+                srv.kill()
+                report = srv.sanitizer_report()
+                if report:
+                    raise AssertionError("sanitizer report:\n" + report)
                 print(f"PASS  {test.__name__}")
             except Exception as e:  # noqa: BLE001
+                if srv.proc and srv.proc.poll() is None:
+                    srv.kill()
                 failed += 1
                 print(f"FAIL  {test.__name__}: {e!r}")
-            finally:
-                srv.kill()
     print(f"\n{len(TESTS) - failed}/{len(TESTS)} passed")
     return 1 if failed else 0
 
