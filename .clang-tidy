@@ -1,0 +1,26 @@
+# Static analysis, run in CI (see .github/workflows/ci.yml). Any finding
+# fails the build. Disabled checks are listed with the reason.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-assignment-in-if-condition,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -misc-include-cleaner,
+  -concurrency-mt-unsafe
+# Why the exclusions:
+#   easily-swappable-parameters  flags every (const char *key, const char *value)
+#   assignment-in-if-condition   `while ((n = getline(...)) != -1)` is idiomatic C
+#   cert-err33-c                 wants every printf/fprintf return value checked
+#   DeprecatedOrUnsafeBufferHandling  recommends Annex K memcpy_s etc., which glibc lacks
+#   misc-include-cleaner         IWYU-style include suggestions, noisy for C
+#   concurrency-mt-unsafe        flags strerror/getenv; only called from one thread here
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'

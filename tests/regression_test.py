@@ -9,12 +9,14 @@ replies. If the server was built with sanitizers, any sanitizer report in
 its stderr fails the test.
 """
 import os
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 
 PORT = None  # chosen per test
 MAX_LINE = 512
@@ -36,17 +38,25 @@ class Server:
         self.binary = binary
         self.workdir = workdir
         self.proc = None
+        self.args = []
         self.stderr_path = os.path.join(workdir, "server.stderr")
 
-    def start(self):
+    def start(self, *args):
+        """Starts the server; extra command-line args are remembered for restarts."""
         global PORT
+        if args:
+            self.args = list(args)
         PORT = free_port()
         self.stderr = open(self.stderr_path, "a")
-        self.proc = subprocess.Popen([self.binary, "-p", str(PORT)], cwd=self.workdir,
+        self.proc = subprocess.Popen([self.binary, "-p", str(PORT)] + self.args,
+                                     cwd=self.workdir,
                                      stdout=subprocess.DEVNULL,
                                      stderr=self.stderr)
         deadline = time.time() + 5
         while time.time() < deadline:
+            if self.proc.poll() is not None:
+                self.stderr.close()
+                raise RuntimeError(f"server exited with code {self.proc.returncode}")
             try:
                 socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()
                 return
@@ -54,11 +64,31 @@ class Server:
                 time.sleep(0.05)
         raise RuntimeError("server did not start")
 
+    def stop(self, sig=signal.SIGTERM, timeout=10):
+        """Graceful shutdown; returns the exit code."""
+        self.proc.send_signal(sig)
+        code = self.proc.wait(timeout=timeout)
+        self.stderr.close()
+        return code
+
+    def stderr_text(self):
+        with open(self.stderr_path, errors="replace") as f:
+            return f.read()
+
+    def threads(self):
+        with open(f"/proc/{self.proc.pid}/status") as f:
+            for line in f:
+                if line.startswith("Threads:"):
+                    return int(line.split()[1])
+        return -1
+
     def kill(self):
         """Simulates a crash: SIGKILL, no chance to clean up."""
-        self.proc.kill()
-        self.proc.wait()
-        self.stderr.close()
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        if not self.stderr.closed:
+            self.stderr.close()
 
     def sanitizer_report(self):
         with open(self.stderr_path, errors="replace") as f:
@@ -89,6 +119,11 @@ class Client:
 
     def close(self):
         self.sock.close()
+
+
+def wal_record(payload):
+    """A WAL record exactly as the server writes it: CRC32 + payload."""
+    return b"%08x %s\n" % (zlib.crc32(payload), payload)
 
 
 def test_basic(srv):
@@ -253,6 +288,173 @@ def test_crash_under_concurrent_load(srv):
     c.close()
     print(f"      {sum(acked)} acknowledged writes, all present after the crash")
 
+def test_pipelined_write_then_read(srv):
+    """With the event loop, a write is completed asynchronously; commands
+    pipelined after it must still run after it, in order."""
+    c = Client()
+    c.send_raw(b"SET a 1\nGET a\nSET a 2\nGET a\nDEL a\nGET a\nDEL a\n")
+    assert [c.read_line() for _ in range(7)] == \
+        ["OK", "1", "OK", "2", "OK", "NOT_FOUND", "NOT_FOUND"]
+    c.close()
+
+
+def test_half_close_gets_all_replies(srv):
+    """`printf 'SET..\\nGET..\\n' | nc` style: the client sends everything,
+    shuts down its sending side, and must still receive every reply."""
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
+    s.sendall(b"".join(b"SET k%d v%d\n" % (i, i) for i in range(50)) + b"GET k49\n")
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break                                  # server closed after replying
+        data += chunk
+    s.close()
+    assert data == b"OK\n" * 50 + b"v49\n"
+
+
+def test_many_connections_few_threads(srv):
+    """300 concurrent connections are served by a handful of threads."""
+    srv.kill()
+    srv.start("--threads", "2")
+    clients = [Client() for _ in range(300)]
+    for i, c in enumerate(clients):
+        c.send_raw(b"SET c%d %d\n" % (i, i))
+    for c in clients:
+        assert c.read_line() == "OK"
+    for i, c in enumerate(clients):
+        assert c.cmd(f"GET c{i}") == str(i)
+    threads = srv.threads()
+    print(f"      300 connections, server has {threads} threads")
+    # main + 2 workers + commit thread (+1 helper thread under ThreadSanitizer)
+    assert threads <= 5
+    for c in clients:
+        c.close()
+
+
+def test_connection_limit(srv):
+    srv.kill()
+    srv.start("--max-connections", "5")
+    time.sleep(0.2)                                # let the startup probe connection close
+    clients = [Client() for _ in range(5)]
+    for c in clients:
+        assert c.cmd("GET x") == "NOT_FOUND"
+    extra = Client()
+    assert extra.read_line() == "ERROR too many connections"
+    try:
+        extra.read_line()
+        raise AssertionError("expected the 6th connection to be closed")
+    except (ConnectionError, ConnectionResetError):
+        pass
+    clients[0].close()
+    time.sleep(0.2)
+    again = Client()                               # a slot is free again
+    assert again.cmd("GET x") == "NOT_FOUND"
+    for c in clients[1:] + [again]:
+        c.close()
+
+
+def test_graceful_shutdown(srv):
+    """SIGTERM (what `docker stop` sends) and SIGINT (Ctrl+C): every write
+    that was acknowledged is on disk, and the process exits with code 0."""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        c = Client()
+        for i in range(100):
+            assert c.cmd(f"SET g{i} {sig.name}") == "OK"
+        idle = Client()                            # an idle connection must not block shutdown
+        assert srv.stop(sig) == 0
+        assert "shutting down" not in srv.stderr_text()   # goes to stdout, not an error
+        c.close()
+        idle.close()
+        srv.start()
+        c = Client()
+        assert c.cmd("GET g99") == sig.name
+        c.close()
+
+
+def test_graceful_shutdown_under_load(srv):
+    clients, stop = 8, threading.Event()
+    acked = [0] * clients
+
+    def writer(c):
+        try:
+            cl = Client()
+            i = 0
+            while not stop.is_set():
+                i += 1
+                if cl.cmd(f"SET s{c}:{i} v") != "OK":
+                    return
+                acked[c] = i
+        except (OSError, ConnectionError):
+            pass
+
+    threads = [threading.Thread(target=writer, args=(c,)) for c in range(clients)]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    assert srv.stop(signal.SIGTERM) == 0
+    stop.set()
+    for t in threads:
+        t.join()
+    srv.start()
+    c = Client()
+    for client, last in enumerate(acked):
+        for i in range(1, last + 1, 7):            # sample: every 7th, plus the last
+            assert c.cmd(f"GET s{client}:{i}") == "v", f"lost s{client}:{i}"
+        if last:
+            assert c.cmd(f"GET s{client}:{last}") == "v"
+    c.close()
+    print(f"      {sum(acked)} acknowledged writes before SIGTERM, all present")
+
+
+def test_compaction_bounds_the_log(srv):
+    srv.kill()
+    srv.start("--compact-bytes", "8192")
+    c = Client()
+    for i in range(3000):
+        assert c.cmd(f"SET key{i % 25} value-{i}") == "OK"
+    c.close()
+    log = os.path.join(srv.workdir, "kv.log")
+    snap = log + ".snap"
+    size = os.path.getsize(log)
+    print(f"      3000 writes: kv.log is {size} bytes, kv.log.snap {os.path.getsize(snap)} bytes")
+    assert size < 8192 + 1024
+    assert os.path.exists(snap)
+    srv.kill()                                     # crash, then recover from snapshot + log
+    srv.start()
+    c = Client()
+    for k in range(25):
+        last = max(i for i in range(3000) if i % 25 == k)
+        assert c.cmd(f"GET key{k}") == f"value-{last}"
+    c.close()
+
+
+def test_corrupt_log_refuses_start_until_repair(srv):
+    srv.kill()
+    log = os.path.join(srv.workdir, "kv.log")
+    good = wal_record(b"SET a 1")
+    bad = bytearray(wal_record(b"SET b 2"))
+    bad[-2] = ord("9")                             # damage: CRC no longer matches
+    with open(log, "wb") as f:
+        f.write(good + bytes(bad) + wal_record(b"SET c 3"))
+    try:
+        srv.start()
+        raise AssertionError("server started on a corrupt log")
+    except RuntimeError as e:
+        assert "exited" in str(e)
+    assert "--repair" in srv.stderr_text()         # tells the operator what to do
+    assert os.path.getsize(log) == len(good) + len(bad) + len(wal_record(b"SET c 3"))
+
+    srv.start("--repair")
+    c = Client()
+    assert c.cmd("GET a") == "1"
+    assert c.cmd("GET b") == "NOT_FOUND"
+    assert c.cmd("GET c") == "NOT_FOUND"
+    c.close()
+    assert os.path.getsize(log) == len(good)
+
+
 TESTS = [
     test_basic,
     test_max_length_record_survives_restart,
@@ -263,6 +465,14 @@ TESTS = [
     test_delete_survives_restart,
     test_wal_failure_refuses_writes,
     test_crash_under_concurrent_load,
+    test_pipelined_write_then_read,
+    test_half_close_gets_all_replies,
+    test_many_connections_few_threads,
+    test_connection_limit,
+    test_graceful_shutdown,
+    test_graceful_shutdown_under_load,
+    test_compaction_bounds_the_log,
+    test_corrupt_log_refuses_start_until_repair,
 ]
 
 

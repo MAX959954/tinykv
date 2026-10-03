@@ -1,4 +1,8 @@
 build/
+out/
+.vs/
 *.o
 kvserver
 kv.log
+kv.log.snap
+kv.log.snap.tmp

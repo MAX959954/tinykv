@@ -10,7 +10,6 @@
 // -r 0 = only SETs, -r 100 = only GETs, -r 90 = 90% GET / 10% SET.
 // -q prints one machine-readable line:
 //   ops_per_sec set_p50_us set_p99_us get_p50_us get_p99_us
-#define _POSIX_C_SOURCE 200809L
 #include <netdb.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -39,7 +38,7 @@ typedef struct {
 static double now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
 }
 
 static int connect_to_server(void) {
@@ -143,17 +142,28 @@ static void prepopulate(void) {
     close(fd);
 }
 
+// Parses a whole-string integer in [min, max]; exits on garbage.
+static int int_arg(const char *s, int min, int max) {
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < min || v > max) {
+        fprintf(stderr, "bad number: %s\n", s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 int main(int argc, char **argv) {
     int opt;
     while ((opt = getopt(argc, argv, "H:p:c:n:r:k:d:q")) != -1) {
         switch (opt) {
         case 'H': host = optarg; break;
         case 'p': port = optarg; break;
-        case 'c': clients = atoi(optarg); break;
-        case 'n': ops = atoi(optarg); break;
-        case 'r': get_pct = atoi(optarg); break;
-        case 'k': keys = atoi(optarg); break;
-        case 'd': value_size = atoi(optarg); break;
+        case 'c': clients = int_arg(optarg, 1, 100000); break;
+        case 'n': ops = int_arg(optarg, 1, 100000000); break;
+        case 'r': get_pct = int_arg(optarg, 0, 100); break;
+        case 'k': keys = int_arg(optarg, 1, 100000000); break;
+        case 'd': value_size = int_arg(optarg, 1, 400); break;
         case 'q': quiet = 1; break;
         default:
             fprintf(stderr, "usage: %s [-H host] [-p port] [-c clients] [-n ops] "
@@ -171,6 +181,12 @@ int main(int argc, char **argv) {
 
     Worker *w = calloc((size_t)clients, sizeof(Worker));
     pthread_t *th = calloc((size_t)clients, sizeof(pthread_t));
+    if (!w || !th) {
+        fprintf(stderr, "out of memory\n");
+        free(w);
+        free(th);
+        return 1;
+    }
     for (int i = 0; i < clients; i++) {
         w[i].id = i + 1;
         w[i].set_lat = malloc(sizeof(double) * (size_t)ops);
@@ -215,5 +231,14 @@ int main(int argc, char **argv) {
         if (total_get) printf("  GET latency: p50 %.0f us, p99 %.0f us\n", g50, g99);
     }
     if (errors) fprintf(stderr, "%ld errors\n", errors);
+
+    for (int i = 0; i < clients; i++) {
+        free(w[i].set_lat);
+        free(w[i].get_lat);
+    }
+    free(w);
+    free(th);
+    free(all_set);
+    free(all_get);
     return errors ? 1 : 0;
 }

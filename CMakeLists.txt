@@ -21,6 +21,10 @@ if(TINYKV_WERROR)
     add_compile_options(-Werror)
 endif()
 
+# Linux/glibc APIs used: epoll, eventfd, accept4, SO_REUSEPORT, getline,
+# pthread_rwlockattr_setkind_np. Defined here once rather than per file.
+add_compile_definitions(_GNU_SOURCE)
+
 find_package(Threads REQUIRED)
 
 # Everything except main(), so unit tests can link against it.
@@ -28,7 +32,9 @@ add_library(kvcore STATIC
     linebuf.c
     command.c
     hashmap.c
+    crc32.c
     wal.c
+    snapshot.c
     store.c
 )
 target_include_directories(kvcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -43,7 +49,7 @@ target_link_libraries(kvbench PRIVATE Threads::Threads)
 # ---- tests ----
 enable_testing()
 
-foreach(t command linebuf hashmap wal store)
+foreach(t command linebuf hashmap wal snapshot store)
     add_executable(test_${t} tests/test_${t}.c)
     target_link_libraries(test_${t} PRIVATE kvcore)
     add_test(NAME unit_${t} COMMAND test_${t})
