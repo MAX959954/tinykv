@@ -1,0 +1,6 @@
+build/
+out/
+.git/
+.vs/
+kv.log
+kv.log.*

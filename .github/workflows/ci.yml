@@ -46,3 +46,36 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
       - name: Run
         run: bash bench/run_bench.sh build --quick
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy
+      - name: Analyze
+        run: |
+          cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          clang-tidy --version
+          clang-tidy -p build --quiet *.c bench/*.c tests/*.c
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (runs the test suite inside)
+        run: docker build -t tinykv .
+      - name: Smoke test
+        run: |
+          docker run -d --name kv -p 9999:9999 tinykv
+          for i in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/9999) 2>/dev/null && break; sleep 0.1; done
+          reply=$(printf 'SET hello world\nGET hello\n' | nc -q1 127.0.0.1 9999)
+          echo "$reply"
+          [ "$reply" = "$(printf 'OK\nworld')" ]
+      - name: docker stop shuts down gracefully
+        run: |
+          time docker stop kv
+          docker logs kv
+          [ "$(docker inspect -f '{{.State.ExitCode}}' kv)" = "0" ]

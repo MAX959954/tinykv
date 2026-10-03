@@ -1,5 +1,6 @@
 #include "check.h"
 #include "hashmap.h"
+#include <stdlib.h>
 
 static void test_set_get_overwrite_del(void) {
     HashMap *m = hashmap_create(16);
@@ -25,8 +26,8 @@ static void test_copies_its_inputs(void) {
     hashmap_destroy(m);
 }
 
-static void test_collisions(void) {
-    // one bucket: every key lands in the same chain
+static void test_deletes_across_resizes(void) {
+    // starts at the minimum size, so it resizes several times on the way
     HashMap *m = hashmap_create(1);
     char k[16], v[16];
     for (int i = 0; i < 100; i++) {
@@ -66,10 +67,65 @@ static void test_many_keys(void) {
     hashmap_destroy(m);
 }
 
+static void test_growth_and_size(void) {
+    HashMap *m = hashmap_create(8);
+    CHECK(hashmap_buckets(m) == 8);
+    char k[32];
+    for (int i = 0; i < 1000; i++) {
+        snprintf(k, sizeof(k), "k%d", i);
+        hashmap_set(m, k, "v");
+        // the load factor never exceeds 3/4
+        CHECK(hashmap_size(m) * 4 <= hashmap_buckets(m) * 3);
+    }
+    CHECK(hashmap_size(m) == 1000);
+    CHECK(hashmap_buckets(m) == 2048);                   // 8 -> ... -> 2048
+    hashmap_set(m, "k5", "overwrite");                   // overwrite: size unchanged
+    CHECK(hashmap_size(m) == 1000);
+    hashmap_del(m, "k5");
+    hashmap_del(m, "missing");
+    CHECK(hashmap_size(m) == 999);
+    hashmap_destroy(m);
+}
+
+static int count_entries(const char *key, const char *value, void *ctx) {
+    (void)value;
+    int *seen = ctx;
+    int i = (int)strtol(key + 1, NULL, 10);              // keys are "k<i>"
+    if (i >= 0 && i < 500) seen[i]++;
+    return 0;
+}
+
+static int stop_at_three(const char *key, const char *value, void *ctx) {
+    (void)key; (void)value;
+    int *n = ctx;
+    return ++*n == 3 ? 42 : 0;
+}
+
+static void test_foreach(void) {
+    HashMap *m = hashmap_create(8);
+    char k[16];
+    for (int i = 0; i < 500; i++) {
+        snprintf(k, sizeof(k), "k%d", i);
+        hashmap_set(m, k, "v");
+    }
+    int seen[500] = {0};
+    CHECK(hashmap_foreach(m, count_entries, seen) == 0);
+    int bad = 0;
+    for (int i = 0; i < 500; i++) if (seen[i] != 1) bad++;
+    CHECK(bad == 0);                                     // every entry exactly once
+
+    int n = 0;
+    CHECK(hashmap_foreach(m, stop_at_three, &n) == 42);  // early stop propagates
+    CHECK(n == 3);
+    hashmap_destroy(m);
+}
+
 int main(void) {
     RUN(test_set_get_overwrite_del);
     RUN(test_copies_its_inputs);
-    RUN(test_collisions);
+    RUN(test_deletes_across_resizes);
     RUN(test_many_keys);
+    RUN(test_growth_and_size);
+    RUN(test_foreach);
     return CHECK_DONE();
 }
