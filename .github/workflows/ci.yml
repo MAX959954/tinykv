@@ -58,7 +58,7 @@ jobs:
         run: |
           cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           clang-tidy --version
-          clang-tidy -p build --quiet *.c bench/*.c tests/*.c
+          clang-tidy -p build --quiet src/*.c bench/*.c tests/*.c
 
   docker:
     name: docker image

@@ -335,14 +335,14 @@ replies stops being read from until it does).
 
 | Path | Responsibility |
 |---|---|
-| `server.c` | Flags, epoll workers, connection state machine, graceful shutdown |
-| `store.c/h` | The store: commit thread, group commit, async/sync API, recovery, compaction |
-| `wal.c/h` | Checksummed record format, the log file, replay with torn-tail/corruption detection |
-| `snapshot.c/h` | Atomic snapshot write and verified load |
-| `hashmap.c/h` | Growable chained hash map |
-| `crc32.c/h` | CRC-32 (IEEE) |
-| `linebuf.c/h` | Reassembles a TCP byte stream into lines |
-| `command.c/h` | Parses a line into a command |
+| `src/server.c` | Flags, epoll workers, connection state machine, graceful shutdown |
+| `src/store.c/h` | The store: commit thread, group commit, async/sync API, recovery, compaction |
+| `src/wal.c/h` | Checksummed record format, the log file, replay with torn-tail/corruption detection |
+| `src/snapshot.c/h` | Atomic snapshot write and verified load |
+| `src/hashmap.c/h` | Growable chained hash map |
+| `src/crc32.c/h` | CRC-32 (IEEE) |
+| `src/linebuf.c/h` | Reassembles a TCP byte stream into lines |
+| `src/command.c/h` | Parses a line into a command |
 | `tests/test_*.c` | Unit tests, one per module (plain C, no framework) |
 | `tests/regression_test.py` | End-to-end tests against a real server process |
 | `bench/` | `kvbench` load generator, `run_bench.sh`, `connections.py` |

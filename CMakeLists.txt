@@ -29,18 +29,18 @@ find_package(Threads REQUIRED)
 
 # Everything except main(), so unit tests can link against it.
 add_library(kvcore STATIC
-    linebuf.c
-    command.c
-    hashmap.c
-    crc32.c
-    wal.c
-    snapshot.c
-    store.c
+    src/linebuf.c
+    src/command.c
+    src/hashmap.c
+    src/crc32.c
+    src/wal.c
+    src/snapshot.c
+    src/store.c
 )
-target_include_directories(kvcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(kvcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kvcore PUBLIC Threads::Threads)
 
-add_executable(kvserver server.c)
+add_executable(kvserver src/server.c)
 target_link_libraries(kvserver PRIVATE kvcore)
 
 add_executable(kvbench bench/kvbench.c)
